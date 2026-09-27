@@ -123,6 +123,45 @@ async def create_job(request: Request, data: JobIn) -> dict:
         return {"id": row["id"], "status": "pending"}
 
 
+MAX_WINDOW_HOURS = 24 * 30
+
+
+@get("/api/stats/ooc")
+async def ooc_stats(request: Request, hours: float = 1.0) -> dict:
+    user_from_request(request)
+    if not (0 < hours <= MAX_WINDOW_HOURS):
+        raise HTTPException(status_code=400, detail=f"窗宽须在 (0, {MAX_WINDOW_HOURS}] 小时内")
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=hours)
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS enqueued,
+                COUNT(*) FILTER (WHERE status='done' AND verdict='合格') AS qualified,
+                COUNT(*) FILTER (WHERE status='done' AND verdict='超差') AS ooc,
+                COUNT(*) FILTER (WHERE status<>'done') AS pending
+            FROM jobs
+            WHERE created_at >= %s AND created_at <= %s
+            """,
+            (start, end),
+        ).fetchone()
+    concluded = row["qualified"] + row["ooc"]
+    return {
+        "window": {
+            "hours": hours,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        },
+        "enqueued": row["enqueued"],
+        "qualified": row["qualified"],
+        "ooc": row["ooc"],
+        "pending": row["pending"],
+        "concluded": concluded,
+        "ooc_ratio": (row["ooc"] / concluded) if concluded else None,
+    }
+
+
 def on_startup() -> None:
     with connect() as conn:
         conn.execute(SCHEMA)
@@ -141,4 +180,4 @@ def on_startup() -> None:
         conn.commit()
 
 
-app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job], on_startup=[on_startup])
+app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job, ooc_stats], on_startup=[on_startup])
