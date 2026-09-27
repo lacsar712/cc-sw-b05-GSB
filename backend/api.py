@@ -10,6 +10,8 @@ from passlib.context import CryptContext
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
+from domain import TOLERANCE_NM
+
 DSN = os.environ.get("DATABASE_URL", "postgresql://app:app@localhost:54395/spectrum")
 SECRET = os.environ.get("JWT_SECRET", "spectrum-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -123,6 +125,49 @@ async def create_job(request: Request, data: JobIn) -> dict:
         return {"id": row["id"], "status": "pending"}
 
 
+def _parse_window_param(raw: str, label: str) -> datetime:
+    try:
+        dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00").replace("z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"窗口{label}时刻格式无效") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+@get("/api/audit/summary")
+async def audit_summary(request: Request, start: str, end: str) -> dict:
+    user_from_request(request)
+    start_dt = _parse_window_param(start, "开始")
+    end_dt = _parse_window_param(end, "结束")
+    if start_dt >= end_dt:
+        raise HTTPException(status_code=400, detail="窗口开始必须早于结束")
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS enqueued,
+                COUNT(*) FILTER (WHERE status = 'done' AND verdict = '合格') AS qualified,
+                COUNT(*) FILTER (WHERE status = 'done' AND verdict = '超差') AS out_of_tolerance,
+                COUNT(*) FILTER (WHERE status <> 'done') AS pending
+            FROM jobs
+            WHERE created_at >= %s AND created_at < %s
+            """,
+            (start_dt, end_dt),
+        ).fetchone()
+    concluded = row["qualified"] + row["out_of_tolerance"]
+    return {
+        "window": {"start": start_dt.isoformat(), "end": end_dt.isoformat()},
+        "enqueued": row["enqueued"],
+        "qualified": row["qualified"],
+        "out_of_tolerance": row["out_of_tolerance"],
+        "pending": row["pending"],
+        "concluded": concluded,
+        "out_of_tolerance_ratio": (row["out_of_tolerance"] / concluded) if concluded else None,
+        "tolerance_nm": TOLERANCE_NM,
+    }
+
+
 def on_startup() -> None:
     with connect() as conn:
         conn.execute(SCHEMA)
@@ -141,4 +186,4 @@ def on_startup() -> None:
         conn.commit()
 
 
-app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job], on_startup=[on_startup])
+app = Litestar(route_handlers=[health, login, list_jobs, get_job, create_job, audit_summary], on_startup=[on_startup])
